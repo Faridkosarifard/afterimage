@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "afterimage"
 dynamic = ["version"]
 description = "Find every place a data subject can still be recovered in an Apache Iceberg lakehouse after a DELETE, and produce erasure evidence."
-readme = "README.rst"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -61,19 +61,23 @@ path = "src/afterimage/__init__.py"
 packages = ["src/afterimage"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/afterimage", "tests", "docs", "README.rst", "CHANGELOG.rst", "CONTRIBUTING.rst", "LICENSE"]
+include = ["src/afterimage", "tests", "docs", "README.md", "CHANGELOG.rst", "CONTRIBUTING.rst", "LICENSE"]
 
 [tool.ruff]
-line-length = 110
+line-length = 120
 target-version = "py311"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PTH", "N", "C4", "PL"]
-ignore = ["PLR0913", "PLR2004", "PLR0912", "PLR0915", "PLC0415"]
+ignore = ["PLR0913", "PLR0917", "PLR2004", "PLR0912", "PLR0915", "PLC0415"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106", "PLR2004", "S608"]
+# Remediation steps are printed for a human to review; nothing here executes SQL or shells.
+"src/afterimage/plan.py" = ["S608", "S604"]
+# Demo scripts use the throwaway credentials of the local playground.
+"demo/**" = ["S105", "S106", "S603", "T201"]
 
 [tool.mypy]
 python_version = "3.11"
