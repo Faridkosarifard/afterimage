@@ -262,17 +262,19 @@ def _find_path(fields: list[pa.Field], field_id: int, prefix: tuple[str, ...] = 
 
 
 def _find_by_name(schema: pa.Schema, dotted: str) -> tuple[str, ...] | None:
-    parts = tuple(dotted.split("."))
+    parts = dotted.split(".")
     fields = list(schema)
+    found: list[str] = []
     for i, part in enumerate(parts):
         match = next((f for f in fields if f.name.lower() == part.lower()), None)
         if match is None:
             return None
+        found.append(match.name)
         if i < len(parts) - 1:
             if not pa.types.is_struct(match.type):
                 return None
             fields = list(match.type)
-    return parts
+    return tuple(found)
 
 
 def _column(table: pa.Table, path: tuple[str, ...]) -> pa.Array:

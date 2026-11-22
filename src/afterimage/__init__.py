@@ -8,7 +8,7 @@ report. It gathers technical evidence; it does not provide legal advice.
 __version__ = "0.1.0"
 
 from afterimage.models import Confidence, Finding, FindingKind, Report, Verdict
-from afterimage.scanner import ScanOptions, Scanner, scan_table
+from afterimage.scanner import Scanner, ScanOptions, scan_table
 from afterimage.subject import Identifier, Subject
 
 __all__ = [

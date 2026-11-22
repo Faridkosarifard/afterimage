@@ -185,6 +185,7 @@ class Scanner:
         #: Raw URIs of files under the table location that no metadata references.
         #: Populated by the orphan check; never written to reports unredacted.
         self.unreferenced_files: list[str] = []
+        self.s3_client: S3Client | None = None
         self._checks: dict[str, CheckResult] = {}
         self._findings: dict[tuple[object, ...], Finding] = {}
         self._contents: dict[str, dict[str, int] | None] = {}
@@ -195,9 +196,7 @@ class Scanner:
         metadata = self.table.metadata
         io = self.table.io
         self.idents = resolve_identifiers(self.subject, metadata.schema())
-        self.inspector = FileInspector(
-            metadata.schema(), metadata.specs(), self.idents, self.options.truncate_length
-        )
+        self.inspector = FileInspector(metadata.schema(), metadata.specs(), self.idents, self.options.truncate_length)
         logger.info(
             "scanning %s for %d identifier(s) across %d snapshot(s)",
             self.redact(self.table_identifier),
@@ -220,9 +219,12 @@ class Scanner:
         )
 
         def contents() -> str:
+            live_now: int | None = 0
             if current_id is not None:
-                live_counts[current_id] = self._snapshot_rows(current_id, index)
-            signals, read, missing = self._content_signals(index, current_id, live_counts.get(current_id, 0))
+                live_now = self._try_snapshot_rows(current_id, index)
+                if live_now is not None:
+                    live_counts[current_id] = live_now
+            signals, read, missing = self._content_signals(index, current_id, live_now)
             self._emit(signals)
             return f"read {read} file(s); {missing} referenced file(s) already missing from storage"
 
@@ -235,7 +237,8 @@ class Scanner:
         self._object_versions()
 
         findings = sorted(
-            self._findings.values(), key=lambda f: (list(FindingKind).index(f.kind), f.location, f.snapshot_ids)
+            self._findings.values(),
+            key=lambda f: (list(FindingKind).index(f.kind), f.location, f.snapshot_ids),
         )
         checks = [self._checks[name] for name in CHECK_NAMES if name in self._checks]
         return Report(
@@ -369,8 +372,9 @@ class Scanner:
         return signals
 
     def _content_signals(
-        self, index: _Index, current_id: int | None, current_live_rows: int
+        self, index: _Index, current_id: int | None, current_live_rows: int | None
     ) -> tuple[list[_Signal], int, int]:
+        """Classify physically retained rows. ``current_live_rows`` is ``None`` when unknown."""
         signals: list[_Signal] = []
         io = self.table.io
         read = missing = 0
@@ -388,6 +392,8 @@ class Scanner:
                 )
             ]
             if not candidates:
+                # Bounds prove the subject is not in this file: record a known-zero result.
+                self._contents.setdefault(normalize_uri(ref.path), {})
                 continue
             counts = self._count(io, ref.path)
             if counts is None:
@@ -405,16 +411,20 @@ class Scanner:
                     if current_live_rows:
                         continue  # reported as live_rows
                     kind = FindingKind.UNREWRITTEN_DATA_FILE
-                    detail = (
-                        "data file in the current snapshot still contains the rows; they are hidden "
-                        "only by delete files (merge-on-read) until the file is rewritten"
-                    )
+                    if current_live_rows is None:
+                        detail = (
+                            "data file in the current snapshot still contains the rows; equality deletes "
+                            "could not be applied, so they are either live or masked by delete files"
+                        )
+                    else:
+                        detail = (
+                            "data file in the current snapshot still contains the rows; they are hidden "
+                            "only by delete files (merge-on-read) until the file is rewritten"
+                        )
                 else:
                     kind = FindingKind.HISTORICAL_DATA_FILE
                     detail = "data file is no longer in the current snapshot but still exists in storage"
-                signals.append(
-                    _Signal(kind, Confidence.CONFIRMED, ref.path, ident, tuple(ref.snapshots), rows, detail)
-                )
+                signals.append(_Signal(kind, Confidence.CONFIRMED, ref.path, ident, tuple(ref.snapshots), rows, detail))
         return signals, read, missing
 
     def _snapshot_rows(self, snapshot_id: int, index: _Index, ident: ResolvedIdentifier | None = None) -> int:
@@ -425,18 +435,39 @@ class Scanner:
             if self.options.file_contents and not self._snapshot_may_match(snapshot_id, index, item):
                 continue
             scan = self.table.scan(
-                row_filter=EqualTo(item.field_name, item.value),
+                row_filter=_equal_to(item.field_name, item.value),
                 selected_fields=(item.field_name,),
                 snapshot_id=snapshot_id,
             )
             total += scan.to_arrow().num_rows
         return total
 
+    def _try_snapshot_rows(
+        self, snapshot_id: int, index: _Index, ident: ResolvedIdentifier | None = None
+    ) -> int | None:
+        """Like :meth:`_snapshot_rows` but returns ``None`` when PyIceberg cannot evaluate deletes."""
+        try:
+            return self._snapshot_rows(snapshot_id, index, ident)
+        except ValueError as exc:
+            if "equality delete" not in str(exc).lower():
+                raise
+            return None
+
+    def _raw_rows_in_snapshot(self, snapshot_id: int, index: _Index, ident: ResolvedIdentifier) -> int:
+        total = 0
+        for path in index.snapshot_files.get(snapshot_id, set()):
+            ref = index.files[path]
+            if ref.content != DataFileContent.DATA:
+                continue
+            counts = self._contents.get(path) or {}
+            total += counts.get(ident.salted_hash, 0)
+        return total
+
     def _snapshot_may_match(self, snapshot_id: int, index: _Index, ident: ResolvedIdentifier) -> bool:
         for path in index.snapshot_files.get(snapshot_id, set()):
-            counts = self._contents.get(path)
-            if counts is None and path not in self._contents:
-                return True  # not inspected (pruned by bounds is fine, unknown is not)
+            if path not in self._contents:
+                return True  # never inspected: cannot rule the snapshot out
+            counts = self._contents[path]
             if counts and counts.get(ident.salted_hash):
                 return True
         return False
@@ -446,15 +477,28 @@ class Scanner:
         for name, ref in metadata.refs.items():
             refs.setdefault(ref.snapshot_id, []).append(name)
         unreadable = 0
+        unevaluated = 0
         signals: list[_Signal] = []
         for snapshot in metadata.snapshots:
             sid = snapshot.snapshot_id
             for ident in self.idents:
+                confidence = Confidence.CONFIRMED
+                caveat = ""
                 try:
-                    rows = self._snapshot_rows(sid, index, ident)
+                    rows = self._try_snapshot_rows(sid, index, ident)
                 except (FileNotFoundError, OSError):
                     unreadable += 1
                     continue
+                if rows is None:
+                    # PyIceberg cannot apply equality deletes. Fall back to rows physically present
+                    # in the snapshot's data files, which over-approximates what a query returns.
+                    unevaluated += 1
+                    rows = self._raw_rows_in_snapshot(sid, index, ident)
+                    confidence = Confidence.POSSIBLE
+                    caveat = (
+                        "; equality deletes could not be applied, so this counts rows physically present "
+                        "in the snapshot's data files (verify with an engine that applies them)"
+                    )
                 if not rows:
                     continue
                 named = f" (referenced by {', '.join(sorted(refs[sid]))})" if sid in refs else ""
@@ -467,16 +511,18 @@ class Scanner:
                 signals.append(
                     _Signal(
                         kind,
-                        Confidence.CONFIRMED,
+                        confidence,
                         f"{self.table_identifier}@{sid}",
                         ident,
                         (sid,),
                         rows,
-                        detail,
+                        detail + caveat,
                     )
                 )
         self._emit(signals)
         detail = f"queried {len(metadata.snapshots)} snapshot(s)"
+        if unevaluated:
+            detail += f"; {unevaluated} snapshot/identifier scan(s) fell back to raw file counts (equality deletes)"
         if unreadable:
             detail += f"; {unreadable} snapshot/identifier scan(s) failed because files are missing"
         return detail
@@ -493,9 +539,7 @@ class Scanner:
             inspected += 1
             old = FromInputFile.table_metadata(io.new_input(uri))
             expired = [
-                s
-                for s in old.snapshots
-                if s.snapshot_id not in current_ids and file_exists(io, s.manifest_list)
+                s for s in old.snapshots if s.snapshot_id not in current_ids and file_exists(io, s.manifest_list)
             ]
             if not expired:
                 continue
@@ -565,18 +609,18 @@ class Scanner:
             inspection = self.inspector.inspect(io, uri, size)
             if inspection is None or inspection.confidence is None:
                 continue
-            idents: list[ResolvedIdentifier | None] = [
+            owners: list[ResolvedIdentifier | None] = [
                 i for i in self.idents if i.salted_hash in inspection.hashes
             ] or [None]
-            for ident in idents:
-                ident_hash = ident.salted_hash if ident else None
+            for owner in owners:
+                ident_hash = owner.salted_hash if owner else None
                 confidence = inspection.confidence_for(ident_hash) or Confidence.POSSIBLE
                 signals.append(
                     _Signal(
                         FindingKind.ORPHAN_METADATA_FILE,
                         confidence,
                         uri,
-                        ident,
+                        owner,
                         (),
                         None,
                         f"unreferenced {file_kind(uri).replace('_', ' ')}: {inspection.describe(ident_hash)}",
@@ -600,10 +644,12 @@ class Scanner:
             return
 
         def run() -> str:
-            assert location is not None
+            if location is None:  # pragma: no cover - guarded above
+                raise _Skip("table is not stored in S3-compatible object storage")
             client = self.options.s3_client or s3_client_from_properties(
                 dict(self.table.io.properties), self.options.s3_properties
             )
+            self.s3_client = client
             status = bucket_versioning_status(client, location.bucket)
             scanner = ObjectVersionScanner(client, self.inspector, self.options.max_download_bytes)
             self.version_hits = scanner.scan(location)
@@ -622,8 +668,7 @@ class Scanner:
                             ident,
                             (),
                             hit.inspection.rows.get(ident_hash, 0) if ident_hash else None,
-                            "noncurrent object version is still retrievable: "
-                            + hit.inspection.describe(ident_hash),
+                            "noncurrent object version is still retrievable: " + hit.inspection.describe(ident_hash),
                             hit.version.version_id,
                         )
                     )
@@ -643,9 +688,7 @@ class Scanner:
                     iceberg_type=str(ident.iceberg_type),
                     salted_hash=ident.salted_hash,
                     findings=len(own),
-                    confirmed_matches=sum(
-                        f.match_count or 0 for f in own if f.confidence is Confidence.CONFIRMED
-                    ),
+                    confirmed_matches=sum(f.match_count or 0 for f in own if f.confidence is Confidence.CONFIRMED),
                 )
             )
         return SubjectEvidence(
@@ -658,6 +701,12 @@ class Scanner:
 
 class _Skip(Exception):  # noqa: N818 - control flow, not an error
     """Raised inside a check to mark it as skipped with a reason."""
+
+
+def _equal_to(column: str, value: object) -> EqualTo:
+    # PyIceberg's EqualTo accepts (term, literal) positionally; its pydantic-generated
+    # signature does not tell mypy that.
+    return EqualTo(column, value)  # type: ignore[call-arg, arg-type]
 
 
 def scan_table(

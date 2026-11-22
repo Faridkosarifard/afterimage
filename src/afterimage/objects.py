@@ -133,10 +133,10 @@ class ObjectVersionScanner:
             return VersionHit(version, Confidence.POSSIBLE, inspection)
         response = self.client.get_object(Bucket=version.bucket, Key=version.key, VersionId=version.version_id)
         data = response["Body"].read()
-        inspection = self.inspector.inspect_bytes(version.key, data)
-        if inspection is None or inspection.confidence is None:
+        found = self.inspector.inspect_bytes(version.key, data)
+        if found is None or found.confidence is None:
             return None
-        return VersionHit(version, inspection.confidence, inspection)
+        return VersionHit(version, found.confidence, found)
 
 
 @dataclass(frozen=True)

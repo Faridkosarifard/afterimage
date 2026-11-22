@@ -188,8 +188,7 @@ def coerce_value(raw: str, iceberg_type: IcebergType) -> Any:
         except ValueError:
             raise IdentifierError("value for a uuid column is not a valid UUID") from None
     raise IdentifierError(
-        f"identifier columns of type {iceberg_type} are not supported yet "
-        f"(supported: string, int, long, uuid)"
+        f"identifier columns of type {iceberg_type} are not supported yet (supported: string, int, long, uuid)"
     )
 
 
