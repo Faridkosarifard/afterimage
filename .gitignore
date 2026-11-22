@@ -14,3 +14,4 @@ demo/out/
 demo/.data/
 # Rendered evidence reports must never be committed: they describe real subjects.
 /reports/
+uv.lock
