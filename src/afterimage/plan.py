@@ -55,15 +55,15 @@ def build_plan(report: Report, catalog: str = "my_catalog") -> list[Step]:
             )
         )
 
-    if kinds & {FindingKind.UNREWRITTEN_DATA_FILE, FindingKind.EQUALITY_DELETE_FILE} or metadata_current:
+    mor_kinds = {FindingKind.UNREWRITTEN_DATA_FILE, FindingKind.EQUALITY_DELETE_FILE}
+    if kinds & mor_kinds:
         steps.append(
             Step(
                 key="rewrite_data_files",
-                title="Rewrite data files and delete files, then rewrite manifests",
+                title="Rewrite data files and delete files",
                 why=(
-                    "Merge-on-read deletes only mask rows; equality-delete files store the identifier "
-                    "itself; and manifests keep the old files' bounds and partition values. Compaction "
-                    "writes new files without the subject and drops the delete files."
+                    "Merge-on-read deletes only mask rows, and equality-delete files store the identifier "
+                    "itself. Compaction writes new files without the subject and drops the delete files."
                 ),
                 spark_sql=[
                     f"CALL {catalog}.system.rewrite_data_files(table => '{table}', "
@@ -71,17 +71,30 @@ def build_plan(report: Report, catalog: str = "my_catalog") -> list[Step]:
                     "options => map('delete-file-threshold', '1', 'rewrite-all', 'true'));",
                     f"CALL {catalog}.system.rewrite_position_delete_files(table => '{table}', "
                     "options => map('rewrite-all', 'true'));",
-                    f"CALL {catalog}.system.rewrite_manifests('{table}');",
                 ],
                 notes=[
                     "PyIceberg cannot compact merge-on-read tables yet; use Spark, Flink, Trino "
                     "(ALTER TABLE ... EXECUTE optimize) or your platform's compaction service.",
                 ],
-                addresses=[
-                    FindingKind.UNREWRITTEN_DATA_FILE,
-                    FindingKind.EQUALITY_DELETE_FILE,
-                    *sorted(_METADATA_KINDS),
+                addresses=sorted(mor_kinds),
+            )
+        )
+
+    if kinds & mor_kinds or metadata_current:
+        steps.append(
+            Step(
+                key="rewrite_manifests",
+                title="Rewrite manifests",
+                why=(
+                    "Manifests of the current snapshot still carry the old files' bounds and partition "
+                    "values, including DELETED entries written by the delete itself."
+                ),
+                spark_sql=[f"CALL {catalog}.system.rewrite_manifests('{table}');"],
+                notes=[
+                    "Any new commit also stops referencing manifests that hold only DELETED entries; "
+                    "the old manifests disappear once the snapshots that used them are expired.",
                 ],
+                addresses=sorted(_METADATA_KINDS),
             )
         )
 

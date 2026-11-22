@@ -21,7 +21,7 @@ def test_live_rows_start_with_logical_delete() -> None:
 
 def test_merge_on_read_residues_need_rewrite_before_expiry() -> None:
     result = keys([finding(FindingKind.UNREWRITTEN_DATA_FILE, [10]), finding(FindingKind.COLUMN_BOUND, [10])])
-    assert result.index("rewrite_data_files") < result.index("expire_snapshots")
+    assert result.index("rewrite_data_files") < result.index("rewrite_manifests") < result.index("expire_snapshots")
     assert result[-2:] == ["prevent", "rescan"]
 
 
@@ -50,5 +50,11 @@ def test_render_plan_contains_commands_and_no_values() -> None:
     text = render_plan(steps)
     assert "rewrite_data_files" in text
     assert "Spark SQL:" in text
-    assert "Addresses: unrewritten_data_file, equality_delete_file" in text
+    assert "Addresses: equality_delete_file, unrewritten_data_file" in text
     assert text.startswith("1. ")
+
+
+def test_bounds_in_current_snapshot_only_need_manifest_rewrite() -> None:
+    result = keys([finding(FindingKind.PARTITION_SUMMARY, [10])])
+    assert "rewrite_manifests" in result
+    assert "rewrite_data_files" not in result
