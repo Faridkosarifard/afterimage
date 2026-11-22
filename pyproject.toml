@@ -61,7 +61,7 @@ path = "src/afterimage/__init__.py"
 packages = ["src/afterimage"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/afterimage", "tests", "docs", "README.md", "CHANGELOG.rst", "CONTRIBUTING.rst", "LICENSE"]
+include = ["src/afterimage", "tests", "docs", "assets", "README.md", "CHANGELOG.rst", "CONTRIBUTING.rst", "LICENSE"]
 
 [tool.ruff]
 line-length = 120
