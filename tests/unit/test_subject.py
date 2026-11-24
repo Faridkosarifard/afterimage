@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import random
+import re
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -16,6 +19,11 @@ from afterimage.subject import (
 )
 
 SALT = "s" * 32
+
+# Printable ASCII plus a few accented letters; "§" is left out so it can act as a separator
+# that can never form part of a value.
+_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@._+-/ %&=?#:éü"
+_TOKEN = re.compile(r"\[redacted(?::[0-9a-f]{12})?\]")
 
 
 def test_parse_splits_on_first_equals_sign() -> None:
@@ -90,6 +98,37 @@ def test_redactor_only_redacts_short_values_in_key_value_segments() -> None:
 def test_redactor_extra_values() -> None:
     redact = Subject([Identifier("email", "a@example.com")], salt=SALT).redactor(extra_values=["other-value"])
     assert "other-value" not in redact("x other-value y")
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_redactor_removes_every_form_of_random_values(seed: int) -> None:
+    rng = random.Random(seed)  # noqa: S311 - reproducible test data
+    values = ["".join(rng.choice(_ALPHABET) for _ in range(rng.randint(4, 40))) for _ in range(3)]
+    subject = Subject([Identifier(f"col{i}", v) for i, v in enumerate(values)], salt=SALT)
+    forms = [
+        form
+        for value in values
+        for form in (
+            value,
+            value.upper(),
+            urllib.parse.quote(value, safe=""),
+            urllib.parse.quote_plus(value, safe=""),
+            urllib.parse.quote(value, safe="").lower(),
+        )
+    ]
+    text = "§" + "§".join(forms) + "§"
+    remaining = _TOKEN.sub("", subject.redactor()(text))
+    assert remaining == "§" * (len(forms) + 1)
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_redactor_removes_short_random_values_from_key_value_segments(seed: int) -> None:
+    rng = random.Random(seed)  # noqa: S311 - reproducible test data
+    value = "".join(rng.choice("0123456789abc") for _ in range(rng.randint(1, 3)))
+    redact = Subject([Identifier("customer_id", value)], salt=SALT).redactor()
+    redacted = redact(f"s3://bucket/data/customer_id={value}/00000-0.parquet")
+    assert f"={value}/" not in redacted
+    assert _TOKEN.search(redacted)
 
 
 def test_read_identifier_file(tmp_path: Path) -> None:

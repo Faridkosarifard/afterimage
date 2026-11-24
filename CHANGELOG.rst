@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 Unreleased
 ----------
 
+Fixed
+~~~~~
+
+* A storage error such as access denied while checking a referenced file was treated as if the file
+  had been deleted, which could produce a ``clean`` verdict while the rows were still in storage. Only
+  a definite "not found" now counts as missing; any other storage or read error, a truncated file, or an
+  identifier column stored in an incomparable type marks the check as an error and the verdict as
+  ``incomplete``.
+
 0.1.0 - 2026-11-22
 ------------------
 

@@ -15,6 +15,7 @@ from pyiceberg.typedef import Record
 from pyiceberg.types import LongType, NestedField, StringType, StructType, UUIDType
 
 from afterimage.matching import (
+    ColumnTypeMismatchError,
     count_parquet_matches,
     match_bounds,
     match_partition,
@@ -207,8 +208,16 @@ def test_count_parquet_matches_nested_and_uuid() -> None:
     assert counts == {handle.salted_hash: 1, ref.salted_hash: 1}
 
 
-def test_count_parquet_matches_type_mismatch_is_ignored() -> None:
+def test_count_parquet_matches_type_mismatch_raises() -> None:
     schema = pa.schema([_field("customer_id", pa.string(), 1)])
     data = pa.table({"customer_id": ["not-a-number"]}, schema=schema)
     (cid,) = resolve("customer_id=1")
+    with pytest.raises(ColumnTypeMismatchError, match="customer_id"):
+        count_parquet_matches(_parquet(data), [cid])
+
+
+def test_count_parquet_matches_integer_out_of_range_is_zero() -> None:
+    schema = pa.schema([_field("customer_id", pa.int32(), 1)])
+    data = pa.table({"customer_id": pa.array([1, 2], pa.int32())}, schema=schema)
+    (cid,) = resolve(f"customer_id={2**40}")
     assert count_parquet_matches(_parquet(data), [cid]) == {cid.salted_hash: 0}

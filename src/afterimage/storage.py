@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 
 from pyarrow.fs import FileSelector, FileType
 from pyiceberg.io import FileIO
@@ -24,12 +25,29 @@ def normalize_uri(uri: str) -> str:
     return f"{scheme}://{path}"
 
 
-def file_exists(io: FileIO, uri: str) -> bool:
+class FileState(Enum):
+    """Whether a file is in storage. ``UNKNOWN`` means storage could not answer."""
+
+    EXISTS = "exists"
+    MISSING = "missing"
+    UNKNOWN = "unknown"
+
+
+def file_state(io: FileIO, uri: str) -> FileState:
+    """Probe ``uri`` without ever mistaking a storage error for a deleted file.
+
+    Only a definite "not found" (``exists()`` returning ``False``, which is how
+    FileIO reports a 404, or :class:`FileNotFoundError`) counts as missing. Any
+    other error, such as a 403 or a network failure, is ``UNKNOWN`` so callers can
+    fail closed instead of reporting a file as erased.
+    """
     try:
-        return io.new_input(uri).exists()
-    except Exception:  # permission errors etc. mean "cannot prove it exists"
+        return FileState.EXISTS if io.new_input(uri).exists() else FileState.MISSING
+    except FileNotFoundError:
+        return FileState.MISSING
+    except Exception:
         logger.debug("could not stat %s", uri, exc_info=True)
-        return False
+        return FileState.UNKNOWN
 
 
 def list_files(io: FileIO, location: str) -> list[tuple[str, int]] | None:

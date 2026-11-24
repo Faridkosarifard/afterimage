@@ -39,7 +39,9 @@ Afterimage turns that inventory into an automated, repeatable check with a machi
 - **Scans** one table for one subject (one or more identifiers such as a surrogate key and an email) across
   every residue class above, with no Spark cluster required.
 - **Reports** findings as JSON (stable schema, pydantic models) and Markdown, with a verdict:
-  `clean`, `residues_found`, or `incomplete` (a check was skipped or failed).
+  `clean`, `residues_found`, or `incomplete` (a check was skipped or failed). Only a definite "not found"
+  counts as a deleted file: access denied, network errors and unreadable files make the check fail, so they
+  lead to `incomplete` rather than `clean`.
 - **Never leaks the identifier**: values stay in memory; reports carry an HMAC-SHA256 of each identifier
   keyed by your salt, plus match counts; paths and log lines are redacted.
 - **Plans** the remediation in the order that actually works: rewrite data files, rewrite manifests,

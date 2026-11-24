@@ -286,6 +286,16 @@ def _column(table: pa.Table, path: tuple[str, ...]) -> pa.Array:
     return array
 
 
+class ColumnTypeMismatchError(ValueError):
+    """A file stores an identifier column in a type the identifier cannot be compared with.
+
+    The file may still hold the subject, so callers must not treat this as zero matches.
+    """
+
+    def __init__(self, column: str, arrow_type: pa.DataType) -> None:
+        super().__init__(f"column {column!r} is stored as {arrow_type} in this file and cannot be compared")
+
+
 def count_parquet_matches(source: str | IO[bytes] | Any, idents: list[ResolvedIdentifier]) -> dict[str, int]:
     """Count rows whose identifier columns equal the subject, ignoring any delete files.
 
@@ -313,7 +323,11 @@ def count_parquet_matches(source: str | IO[bytes] | Any, idents: list[ResolvedId
         value = ident.bound_value
         try:
             mask = pc.equal(array, pa.scalar(value, type=array.type))
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
-            continue
+        except pa.ArrowInvalid:
+            if pa.types.is_integer(array.type) and isinstance(value, int):
+                continue  # out of range for a narrower integer column: cannot be stored there
+            raise ColumnTypeMismatchError(ident.column, array.type) from None
+        except (pa.ArrowNotImplementedError, pa.ArrowTypeError):
+            raise ColumnTypeMismatchError(ident.column, array.type) from None
         counts[ident.salted_hash] = int(pc.sum(mask).as_py() or 0)
     return counts
