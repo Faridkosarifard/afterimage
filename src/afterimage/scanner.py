@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import pyarrow as pa
 from pyiceberg.expressions import EqualTo
 from pyiceberg.io import FileIO
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestEntry, ManifestEntryStatus, ManifestFile
@@ -33,6 +34,7 @@ import afterimage
 from afterimage.inspect_files import FileInspector, file_kind
 from afterimage.matching import (
     DEFAULT_TRUNCATE_LENGTH,
+    ColumnTypeMismatchError,
     ResolvedIdentifier,
     count_parquet_matches,
     match_bounds,
@@ -61,7 +63,7 @@ from afterimage.objects import (
     bucket_versioning_status,
     s3_client_from_properties,
 )
-from afterimage.storage import S3Location, file_exists, list_files, normalize_uri
+from afterimage.storage import FileState, S3Location, file_state, list_files, normalize_uri
 from afterimage.subject import HASH_ALGORITHM, Redactor, Subject
 
 if TYPE_CHECKING:
@@ -224,9 +226,12 @@ class Scanner:
                 live_now = self._try_snapshot_rows(current_id, index)
                 if live_now is not None:
                     live_counts[current_id] = live_now
-            signals, read, missing = self._content_signals(index, current_id, live_now)
+            signals, read, missing, unreadable = self._content_signals(index, current_id, live_now)
             self._emit(signals)
-            return f"read {read} file(s); {missing} referenced file(s) already missing from storage"
+            detail = f"read {read} file(s); {missing} referenced file(s) missing from storage"
+            if unreadable:
+                raise _Incomplete(f"{detail}; {_unreadable_note(unreadable)}")
+            return detail
 
         self._run_check("file_contents", self.options.file_contents, contents)
         self._run_check(
@@ -268,6 +273,10 @@ class Scanner:
             self._checks[name] = CheckResult(name=name, state=CheckState.RAN, detail=self.redact(detail))
         except _Skip as skip:
             self._checks[name] = CheckResult(name=name, state=CheckState.SKIPPED, detail=self.redact(str(skip)))
+        except _Incomplete as incomplete:
+            detail = self.redact(str(incomplete))
+            logger.warning("check %s is incomplete: %s", name, detail)
+            self._checks[name] = CheckResult(name=name, state=CheckState.ERROR, detail=detail)
         except Exception as exc:
             logger.error("check %s failed: %s", name, self.redact(f"{type(exc).__name__}: {exc}"))
             logger.debug("traceback", exc_info=logger.isEnabledFor(logging.DEBUG))
@@ -300,14 +309,27 @@ class Scanner:
             )
 
     def _count(self, io: FileIO, path: str) -> dict[str, int] | None:
-        """Raw match counts for a file, or ``None`` if the file no longer exists."""
+        """Raw match counts for a file, or ``None`` if the file no longer exists.
+
+        Raises :class:`_Unreadable` when storage cannot say whether the file exists or the
+        file cannot be read. Such files are not cached, so later checks cannot rule them out.
+        """
         key = normalize_uri(path)
         if key not in self._contents:
-            if not file_exists(io, path):
+            state = file_state(io, path)
+            if state is FileState.UNKNOWN:
+                raise _Unreadable(path)
+            if state is FileState.MISSING:
                 self._contents[key] = None
             else:
-                with io.new_input(path).open() as stream:
-                    self._contents[key] = count_parquet_matches(stream, self.idents)
+                try:
+                    with io.new_input(path).open() as stream:
+                        self._contents[key] = count_parquet_matches(stream, self.idents)
+                except FileNotFoundError:
+                    self._contents[key] = None
+                except (OSError, pa.ArrowException, ColumnTypeMismatchError) as exc:
+                    logger.debug("could not read %s", self.redact(path), exc_info=True)
+                    raise _Unreadable(path) from exc
         return self._contents[key]
 
     # --------------------------------------------------------------- checks
@@ -373,11 +395,14 @@ class Scanner:
 
     def _content_signals(
         self, index: _Index, current_id: int | None, current_live_rows: int | None
-    ) -> tuple[list[_Signal], int, int]:
-        """Classify physically retained rows. ``current_live_rows`` is ``None`` when unknown."""
+    ) -> tuple[list[_Signal], int, int, int]:
+        """Classify physically retained rows. ``current_live_rows`` is ``None`` when unknown.
+
+        Returns the signals and the number of files read, missing and unreadable.
+        """
         signals: list[_Signal] = []
         io = self.table.io
-        read = missing = 0
+        read = missing = unreadable = 0
         for ref in index.files.values():
             if ref.content == DataFileContent.POSITION_DELETES:
                 continue
@@ -395,7 +420,11 @@ class Scanner:
                 # Bounds prove the subject is not in this file: record a known-zero result.
                 self._contents.setdefault(normalize_uri(ref.path), {})
                 continue
-            counts = self._count(io, ref.path)
+            try:
+                counts = self._count(io, ref.path)
+            except _Unreadable:
+                unreadable += 1
+                continue
             if counts is None:
                 missing += 1
                 continue
@@ -425,7 +454,7 @@ class Scanner:
                     kind = FindingKind.HISTORICAL_DATA_FILE
                     detail = "data file is no longer in the current snapshot but still exists in storage"
                 signals.append(_Signal(kind, Confidence.CONFIRMED, ref.path, ident, tuple(ref.snapshots), rows, detail))
-        return signals, read, missing
+        return signals, read, missing, unreadable
 
     def _snapshot_rows(self, snapshot_id: int, index: _Index, ident: ResolvedIdentifier | None = None) -> int:
         """Rows matching the subject in a snapshot, with delete files applied."""
@@ -476,6 +505,7 @@ class Scanner:
         refs: dict[int, list[str]] = {}
         for name, ref in metadata.refs.items():
             refs.setdefault(ref.snapshot_id, []).append(name)
+        missing = 0
         unreadable = 0
         unevaluated = 0
         signals: list[_Signal] = []
@@ -486,7 +516,11 @@ class Scanner:
                 caveat = ""
                 try:
                     rows = self._try_snapshot_rows(sid, index, ident)
-                except (FileNotFoundError, OSError):
+                except FileNotFoundError:
+                    missing += 1
+                    continue
+                except (OSError, pa.ArrowException):
+                    logger.debug("could not read snapshot %d", sid, exc_info=True)
                     unreadable += 1
                     continue
                 if rows is None:
@@ -523,31 +557,46 @@ class Scanner:
         detail = f"queried {len(metadata.snapshots)} snapshot(s)"
         if unevaluated:
             detail += f"; {unevaluated} snapshot/identifier scan(s) fell back to raw file counts (equality deletes)"
+        if missing:
+            detail += f"; {missing} snapshot/identifier scan(s) skipped because referenced files are missing"
         if unreadable:
-            detail += f"; {unreadable} snapshot/identifier scan(s) failed because files are missing"
+            raise _Incomplete(
+                f"{detail}; {unreadable} snapshot/identifier scan(s) failed with a storage or format error, "
+                "so those snapshots may still return the subject"
+            )
         return detail
 
     def _metadata_log(self, metadata: TableMetadata) -> str:
         io = self.table.io
         current_ids = {s.snapshot_id for s in metadata.snapshots}
-        inspected = 0
+        inspected = unreadable = 0
         for log_entry in metadata.metadata_log:
             uri = log_entry.metadata_file
             self._referenced.add(normalize_uri(uri))
-            if not file_exists(io, uri):
+            state = file_state(io, uri)
+            if state is FileState.UNKNOWN:
+                unreadable += 1
+            if state is not FileState.EXISTS:
                 continue
             inspected += 1
             old = FromInputFile.table_metadata(io.new_input(uri))
-            expired = [
-                s for s in old.snapshots if s.snapshot_id not in current_ids and file_exists(io, s.manifest_list)
-            ]
+            expired = []
+            for snapshot in old.snapshots:
+                if snapshot.snapshot_id in current_ids:
+                    continue
+                list_state = file_state(io, snapshot.manifest_list)
+                if list_state is FileState.EXISTS:
+                    expired.append(snapshot)
+                elif list_state is FileState.UNKNOWN:
+                    unreadable += 1
             if not expired:
                 continue
             sub_index = _Index.build(expired, io)
             self._referenced |= sub_index.referenced_uris()
             signals = self._metadata_signals(sub_index, old)
             if self.options.file_contents:
-                content, _read, _missing = self._content_signals(sub_index, None, 0)
+                content, _read, _missing, content_unreadable = self._content_signals(sub_index, None, 0)
+                unreadable += content_unreadable
                 signals.extend(content)
             if not signals:
                 continue
@@ -579,7 +628,10 @@ class Scanner:
                         )
                     ]
                 )
-        return f"inspected {inspected} previous metadata file(s)"
+        detail = f"inspected {inspected} previous metadata file(s)"
+        if unreadable:
+            raise _Incomplete(f"{detail}; {_unreadable_note(unreadable)}")
+        return detail
 
     def _orphans(self) -> str:
         io = self.table.io
@@ -589,9 +641,14 @@ class Scanner:
         orphans = [(uri, size) for uri, size in listed if normalize_uri(uri) not in self._referenced]
         self.unreferenced_files = [uri for uri, _ in orphans]
         signals: list[_Signal] = []
+        unreadable = 0
         for uri, size in orphans:
             if file_kind(uri) == "parquet":
-                counts = self._count(io, uri) or {}
+                try:
+                    counts = self._count(io, uri) or {}
+                except _Unreadable:
+                    unreadable += 1
+                    continue
                 for ident in self.idents:
                     if counts.get(ident.salted_hash):
                         signals.append(
@@ -627,7 +684,10 @@ class Scanner:
                     )
                 )
         self._emit(signals)
-        return f"listed {len(listed)} file(s), {len(orphans)} not referenced by table metadata"
+        detail = f"listed {len(listed)} file(s), {len(orphans)} not referenced by table metadata"
+        if unreadable:
+            raise _Incomplete(f"{detail}; {_unreadable_note(unreadable)}")
+        return detail
 
     def _object_versions(self) -> None:
         name = "object_versions"
@@ -701,6 +761,21 @@ class Scanner:
 
 class _Skip(Exception):  # noqa: N818 - control flow, not an error
     """Raised inside a check to mark it as skipped with a reason."""
+
+
+class _Incomplete(Exception):  # noqa: N818 - control flow, not an error
+    """Raised at the end of a check whose findings may be incomplete; marks it as an error."""
+
+
+class _Unreadable(Exception):  # noqa: N818 - control flow, not an error
+    """A file whose existence or contents could not be determined (raw path in ``args``)."""
+
+
+def _unreadable_note(count: int) -> str:
+    return (
+        f"{count} file(s) could not be checked because of a storage or format error "
+        "(for example access denied), so they may still hold the subject"
+    )
 
 
 def _equal_to(column: str, value: object) -> EqualTo:

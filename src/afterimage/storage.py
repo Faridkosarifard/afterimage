@@ -50,14 +50,6 @@ def file_state(io: FileIO, uri: str) -> FileState:
         return FileState.UNKNOWN
 
 
-def file_exists(io: FileIO, uri: str) -> bool:
-    try:
-        return io.new_input(uri).exists()
-    except Exception:  # permission errors etc. mean "cannot prove it exists"
-        logger.debug("could not stat %s", uri, exc_info=True)
-        return False
-
-
 def list_files(io: FileIO, location: str) -> list[tuple[str, int]] | None:
     """Recursively list ``(uri, size)`` for every file under ``location``.
 
